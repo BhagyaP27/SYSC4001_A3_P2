@@ -26,7 +26,7 @@ SYSC4001_A3P2/
 ├── ta_marking_2a_<student1>_<student2>.cpp  # Part 2a (without semaphores)
 ├── ta_marking_2b_<student1>_<student2>.cpp  # Part 2b (with semaphores)
 ├── setup_test_files.sh                       # Creates test files
-├── Makefile                                   # Build script
+├── setup_test_files.sh                        # Build script
 ├── README.md                                  # This file
 └── PartC.pdf                                  # Analysis report
 ```
