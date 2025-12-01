@@ -2,7 +2,7 @@
 
 **Team Members:**
 - Student 1: Bhagya Patel - 101324150
-- Student 2: [Name] - [Student Number]
+- Student 2:Oluwatobi Olowookere - 101245900
 
 ---
 
@@ -28,7 +28,7 @@ SYSC4001_A3P2/
 ├── setup_test_files.sh                       # Creates test files
 ├── Makefile                                   # Build script
 ├── README.md                                  # This file
-└── reportPartC.pdf                            # Analysis report
+└── PartC.pdf                                  # Analysis report
 ```
 
 ---
