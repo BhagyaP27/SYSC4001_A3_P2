@@ -2,216 +2,318 @@
  * @file ta_marking_part_a.cpp
  * @brief Part A: TA Marking System WITHOUT Semaphores
  * @author Student 1: Bhagya Patel (101324150)
- * @author Student 2: [Name, ID]
- * 
- * This version allows race conditions to demonstrate the need for synchronization
- */
-
+ * @author Student 2: Oluwatobi Olowookere (101245900)
+ * Part 2a: Concurrent TA marking WITHOUT semaphores (will have race conditions)
+ * */
+ 
 #include <iostream>
 #include <fstream>
+#include <sstream>
+#include <string>
+#include <vector>
+#include <unistd.h>
+#include <sys/wait.h>
 #include <sys/mman.h>
 #include <sys/stat.h>
 #include <fcntl.h>
-#include <unistd.h>
-#include <sys/wait.h>
 #include <cstring>
 #include <cstdlib>
 #include <ctime>
-#include <vector>
-#include <sstream>
+#include <random>
+#include <dirent.h>
+#include <algorithm>
 
-using namespace std;
+#define MAX_RUBRIC_SIZE 2048
+#define MAX_EXAM_SIZE 4096
+#define MAX_EXAMS 100
+#define NUM_QUESTIONS 5
 
-// Shared memory structure
-struct SharedMemory {
-    char current_exam[100];           // Current exam student number
-    int exam_number;                  // Current exam index
-    bool questions_marked[5];         // Which questions are marked
-    bool all_questions_done;          // All questions for current exam done
-    char rubric[5][50];              // Rubric lines
-    int rubric_version;               // Track rubric updates
-    bool terminate;                   // Termination flag
+// Structure for exam in shared memory
+struct ExamData {
+    char exam_content[MAX_EXAM_SIZE];
+    int student_number;
+    bool questions_marked[NUM_QUESTIONS];  // Track which questions are marked
+    bool in_use;                           // Is this exam currently being worked on
+    int questions_completed;               // How many questions done
 };
 
-// Random delay between min and max seconds
-void random_delay(double min_sec, double max_sec) {
-    double range = max_sec - min_sec;
-    double random = ((double)rand() / RAND_MAX) * range + min_sec;
-    usleep((int)(random * 1000000));
+// Shared memory structure
+struct SharedData {
+    char rubric[MAX_RUBRIC_SIZE];          // Rubric in shared memory
+    ExamData exams[MAX_EXAMS];             // Multiple exams can be in memory
+    int total_exams_loaded;                // How many exams have been loaded
+    bool all_done;                         // Signal to finish
+    char exam_filenames[MAX_EXAMS][256];   // List of exam files
+    int num_exam_files;                    // Total number of exam files available
+    int next_exam_to_load;                 // Index of next exam to load
+};
+
+// Get random delay
+double get_random_delay(double min_sec, double max_sec) {
+    static thread_local std::mt19937 gen(std::random_device{}() + getpid());
+    std::uniform_real_distribution<> dis(min_sec, max_sec);
+    return dis(gen);
 }
 
-// Load rubric from file into shared memory
-void load_rubric(SharedMemory* shm) {
-    ifstream rubric_file("rubric.txt");
-    if (!rubric_file.is_open()) {
-        cerr << "Error: Cannot open rubric.txt" << endl;
+// Load rubric from file
+void load_rubric(SharedData* shared) {
+    std::ifstream file("rubric.txt");
+    if (!file.is_open()) {
+        std::cerr << "Error: Cannot open rubric.txt\n";
+        exit(1);
+    }
+    
+    std::string content((std::istreambuf_iterator<char>(file)),
+                        std::istreambuf_iterator<char>());
+    strncpy(shared->rubric, content.c_str(), MAX_RUBRIC_SIZE - 1);
+    shared->rubric[MAX_RUBRIC_SIZE - 1] = '\0';
+    file.close();
+}
+
+// Save rubric to file
+void save_rubric(SharedData* shared) {
+    std::ofstream file("rubric.txt");
+    if (!file.is_open()) {
+        std::cerr << "Error: Cannot write rubric.txt\n";
         return;
     }
-    
-    string line;
-    int i = 0;
-    while (getline(rubric_file, line) && i < 5) {
-        strcpy(shm->rubric[i], line.c_str());
-        i++;
-    }
-    rubric_file.close();
+    file << shared->rubric;
+    file.close();
 }
 
-// Load exam into shared memory
-bool load_exam(SharedMemory* shm, int exam_num) {
-    char filename[100];
-    sprintf(filename, "exams/exam_%04d.txt", exam_num);
-    
-    ifstream exam_file(filename);
-    if (!exam_file.is_open()) {
+// Load an exam file into shared memory
+bool load_exam_into_memory(SharedData* shared, const std::string& filename, int exam_slot) {
+    std::ifstream file(filename);
+    if (!file.is_open()) {
         return false;
     }
     
-    string line;
-    getline(exam_file, line);
+    // Read entire file
+    std::string content((std::istreambuf_iterator<char>(file)),
+                        std::istreambuf_iterator<char>());
+    file.close();
     
-    // Extract student number
-    size_t pos = line.find("Student:");
-    if (pos != string::npos) {
-        string student_num = line.substr(pos + 9);
-        // Trim whitespace
-        student_num.erase(0, student_num.find_first_not_of(" \t"));
-        student_num.erase(student_num.find_last_not_of(" \t\n\r") + 1);
-        strcpy(shm->current_exam, student_num.c_str());
+    // Parse student number (first line)
+    size_t first_newline = content.find('\n');
+    if (first_newline == std::string::npos) return false;
+    
+    int student_num = std::stoi(content.substr(0, first_newline));
+    
+    // Store in shared memory
+    strncpy(shared->exams[exam_slot].exam_content, content.c_str(), MAX_EXAM_SIZE - 1);
+    shared->exams[exam_slot].exam_content[MAX_EXAM_SIZE - 1] = '\0';
+    shared->exams[exam_slot].student_number = student_num;
+    shared->exams[exam_slot].in_use = false;
+    shared->exams[exam_slot].questions_completed = 0;
+    
+    for (int i = 0; i < NUM_QUESTIONS; i++) {
+        shared->exams[exam_slot].questions_marked[i] = false;
     }
-    
-    exam_file.close();
-    
-    // Reset question flags
-    for (int i = 0; i < 5; i++) {
-        shm->questions_marked[i] = false;
-    }
-    shm->all_questions_done = false;
     
     return true;
 }
 
-// TA process function
-void ta_process(int ta_id, SharedMemory* shm) {
-    srand(time(NULL) + ta_id);
+// Review rubric and potentially correct it
+void review_and_correct_rubric(SharedData* shared, int ta_id) {
+    std::cout << "[TA " << ta_id << "] Accessing rubric to review\n";
     
-    cout << "[TA " << ta_id << "] Started marking" << endl;
+    // Parse rubric lines
+    std::istringstream iss(shared->rubric);
+    std::string line;
+    std::vector<std::string> lines;
     
-    while (!shm->terminate) {
-        // Check if current exam is done
-        if (shm->all_questions_done) {
-            usleep(100000); // Wait for next exam
-            continue;
-        }
-        
-        // Review and potentially correct rubric
-        cout << "[TA " << ta_id << "] Reviewing rubric for exam " 
-             << shm->current_exam << endl;
-        
-        for (int q = 0; q < 5; q++) {
-            random_delay(0.5, 1.0);
-            
-            // Randomly decide to correct rubric
-            if (rand() % 10 < 3) { // 30% chance
-                // WARNING: Race condition possible here!
-                cout << "[TA " << ta_id << "] Correcting rubric line " << (q + 1) << endl;
-                
-                // Parse rubric line
-                char line[50];
-                strcpy(line, shm->rubric[q]);
-                
-                // Find the character after comma
-                char* comma = strchr(line, ',');
-                if (comma && *(comma + 2)) {
-                    *(comma + 2) = *(comma + 2) + 1; // Increment ASCII
-                    strcpy(shm->rubric[q], line);
-                    shm->rubric_version++;
-                    
-                    // Save to file (WARNING: Race condition!)
-                    ofstream rubric_file("rubric.txt");
-                    for (int i = 0; i < 5; i++) {
-                        rubric_file << shm->rubric[i] << endl;
-                    }
-                    rubric_file.close();
-                    
-                    cout << "[TA " << ta_id << "] Updated rubric to: " << line << endl;
-                }
-            }
-        }
-        
-        // Try to mark a question
-        bool marked_something = false;
-        for (int q = 0; q < 5; q++) {
-            // WARNING: Race condition - multiple TAs might see same unmarked question
-            if (!shm->questions_marked[q]) {
-                cout << "[TA " << ta_id << "] Marking question " << (q + 1) 
-                     << " for student " << shm->current_exam << endl;
-                
-                // Mark the question (WARNING: Race condition!)
-                shm->questions_marked[q] = true;
-                
-                // Simulate marking time
-                random_delay(1.0, 2.0);
-                
-                cout << "[TA " << ta_id << "] Finished marking question " << (q + 1) 
-                     << " for student " << shm->current_exam << endl;
-                
-                marked_something = true;
-                break;
-            }
-        }
-        
-        // Check if all questions are done
-        bool all_done = true;
-        for (int q = 0; q < 5; q++) {
-            if (!shm->questions_marked[q]) {
-                all_done = false;
-                break;
-            }
-        }
-        
-        if (all_done && !shm->all_questions_done) {
-            shm->all_questions_done = true;
-            
-            // Load next exam (WARNING: Race condition - multiple TAs might try!)
-            int next_exam = shm->exam_number + 1;
-            cout << "[TA " << ta_id << "] Loading next exam " << next_exam << endl;
-            
-            if (load_exam(shm, next_exam)) {
-                shm->exam_number = next_exam;
-                
-                // Check for termination
-                if (strcmp(shm->current_exam, "9999") == 0) {
-                    cout << "[TA " << ta_id << "] Found termination exam 9999" << endl;
-                    shm->terminate = true;
-                    break;
-                }
-            }
-        }
-        
-        if (!marked_something) {
-            usleep(100000); // Brief wait if nothing to do
+    while (std::getline(iss, line)) {
+        if (!line.empty()) {
+            lines.push_back(line);
         }
     }
     
-    cout << "[TA " << ta_id << "] Finished marking" << endl;
+    bool needs_correction = false;
+    int line_to_correct = -1;
+    
+    // Iterate through each question in rubric
+    for (size_t i = 0; i < lines.size() && i < NUM_QUESTIONS; i++) {
+        // Decision time: 0.5-1.0 seconds
+        std::cout << "[TA " << ta_id << "] Reviewing rubric question " << (i+1) << "...\n";
+        usleep(get_random_delay(0.5, 1.0) * 1000000);
+        
+        // Randomly decide if correction needed
+        if (rand() % 100 < 30) {  // 30% chance
+            std::cout << "[TA " << ta_id << "] Detected error in rubric question " << (i+1) << "\n";
+            needs_correction = true;
+            line_to_correct = i;
+            break;  // Only correct one per review
+        }
+    }
+    
+    if (needs_correction && line_to_correct >= 0 && line_to_correct < (int)lines.size()) {
+        std::cout << "[TA " << ta_id << "] Correcting rubric question " << (line_to_correct + 1) << "\n";
+        
+        // Find character after comma and increment it
+        std::string& line = lines[line_to_correct];
+        size_t comma_pos = line.find(',');
+        
+        if (comma_pos != std::string::npos && comma_pos + 2 < line.length()) {
+            char old_char = line[comma_pos + 2];
+            line[comma_pos + 2] = old_char + 1;
+            std::cout << "[TA " << ta_id << "] Changed '" << old_char << "' to '" 
+                      << line[comma_pos + 2] << "' in question " << (line_to_correct + 1) << "\n";
+        }
+        
+        // Rebuild rubric
+        std::ostringstream new_rubric;
+        for (const auto& l : lines) {
+            new_rubric << l << "\n";
+        }
+        
+        // Update shared memory (RACE CONDITION HERE - no synchronization)
+        strncpy(shared->rubric, new_rubric.str().c_str(), MAX_RUBRIC_SIZE - 1);
+        shared->rubric[MAX_RUBRIC_SIZE - 1] = '\0';
+        
+        // Save to file
+        save_rubric(shared);
+        std::cout << "[TA " << ta_id << "] Saved corrected rubric to file\n";
+    }
+}
+
+// Find an exam with unmarked questions
+int find_exam_to_mark(SharedData* shared) {
+    for (int i = 0; i < shared->total_exams_loaded; i++) {
+        if (shared->exams[i].student_number != 9999 && 
+            shared->exams[i].questions_completed < NUM_QUESTIONS) {
+            return i;
+        }
+    }
+    return -1;
+}
+
+// Mark one question on an exam
+bool mark_one_question(SharedData* shared, int ta_id, int exam_idx) {
+    // Find an unmarked question (RACE CONDITION - multiple TAs might pick same question)
+    int question_to_mark = -1;
+    for (int i = 0; i < NUM_QUESTIONS; i++) {
+        if (!shared->exams[exam_idx].questions_marked[i]) {
+            question_to_mark = i;
+            shared->exams[exam_idx].questions_marked[i] = true;  // Mark as being worked on
+            break;
+        }
+    }
+    
+    if (question_to_mark == -1) {
+        return false;  // All questions already marked
+    }
+    
+    int student_num = shared->exams[exam_idx].student_number;
+    
+    std::cout << "[TA " << ta_id << "] Marking question " << (question_to_mark + 1) 
+              << " for student " << student_num << "\n";
+    
+    // Marking time: 1.0-2.0 seconds
+    usleep(get_random_delay(1.0, 2.0) * 1000000);
+    
+    std::cout << "[TA " << ta_id << "] Finished marking question " << (question_to_mark + 1)
+              << " for student " << student_num << "\n";
+    
+    // Update completion count (RACE CONDITION)
+    shared->exams[exam_idx].questions_completed++;
+    
+    return true;
+}
+
+// TA process main function
+void ta_process(SharedData* shared, int ta_id) {
+    std::cout << "[TA " << ta_id << "] Started working\n";
+    
+    while (!shared->all_done) {
+        // Step 1: Review rubric
+        review_and_correct_rubric(shared, ta_id);
+        
+        // Step 2: Find an exam to mark
+        int exam_idx = find_exam_to_mark(shared);
+        
+        if (exam_idx == -1) {
+            // No exams available, try to load next one (RACE CONDITION)
+            if (shared->next_exam_to_load < shared->num_exam_files) {
+                int next_idx = shared->next_exam_to_load;
+                shared->next_exam_to_load++;
+                
+                if (next_idx < shared->num_exam_files) {
+                    std::string filename = shared->exam_filenames[next_idx];
+                    std::cout << "[TA " << ta_id << "] Loading " << filename << " into shared memory\n";
+                    
+                    int slot = shared->total_exams_loaded;
+                    if (slot < MAX_EXAMS && load_exam_into_memory(shared, filename, slot)) {
+                        shared->total_exams_loaded++;
+                        
+                        // Check if this is the termination exam
+                        if (shared->exams[slot].student_number == 9999) {
+                            std::cout << "[TA " << ta_id << "] Found student 9999 - signaling completion\n";
+                            shared->all_done = true;
+                            break;
+                        }
+                    }
+                }
+            } else {
+                // No more exams to load
+                usleep(100000);  // Wait a bit and check again
+            }
+        } else {
+            // Step 3: Mark one question on the exam
+            mark_one_question(shared, ta_id, exam_idx);
+        }
+        
+        usleep(50000);  // Small delay
+    }
+    
+    std::cout << "[TA " << ta_id << "] Finished working\n";
+}
+
+// Get list of exam files
+void get_exam_files(SharedData* shared) {
+    std::vector<std::string> files;
+    
+    // Look for exam_*.txt files
+    DIR* dir = opendir(".");
+    if (dir) {
+        struct dirent* entry;
+        while ((entry = readdir(dir)) != nullptr) {
+            std::string filename = entry->d_name;
+            if (filename.find("exam_") == 0 && filename.find(".txt") != std::string::npos) {
+                files.push_back(filename);
+            }
+        }
+        closedir(dir);
+    }
+    
+    // Sort files
+    std::sort(files.begin(), files.end());
+    
+    // Store in shared memory
+    shared->num_exam_files = std::min((int)files.size(), MAX_EXAMS);
+    for (int i = 0; i < shared->num_exam_files; i++) {
+        strncpy(shared->exam_filenames[i], files[i].c_str(), 255);
+        shared->exam_filenames[i][255] = '\0';
+    }
+    
+    std::cout << "Found " << shared->num_exam_files << " exam files\n";
 }
 
 int main(int argc, char* argv[]) {
     if (argc != 2) {
-        cerr << "Usage: " << argv[0] << " <number_of_TAs>" << endl;
+        std::cerr << "Usage: " << argv[0] << " <number_of_TAs>\n";
         return 1;
     }
     
     int num_tas = atoi(argv[1]);
     if (num_tas < 2) {
-        cerr << "Error: Need at least 2 TAs" << endl;
+        std::cerr << "Error: Must have at least 2 TAs\n";
         return 1;
     }
     
-    cout << "=== TA Marking System - Part A (WITHOUT Semaphores) ===" << endl;
-    cout << "Number of TAs: " << num_tas << endl;
-    cout << "WARNING: Race conditions may occur!" << endl << endl;
+    std::cout << "=== TA Marking System (Part 2a - WITHOUT semaphores) ===\n";
+    std::cout << "Number of TAs: " << num_tas << "\n\n";
+    
+    srand(time(NULL));
     
     // Create shared memory
     int shm_fd = shm_open("/ta_marking_shm", O_CREAT | O_RDWR, 0666);
@@ -220,32 +322,48 @@ int main(int argc, char* argv[]) {
         return 1;
     }
     
-    ftruncate(shm_fd, sizeof(SharedMemory));
+    ftruncate(shm_fd, sizeof(SharedData));
     
-    SharedMemory* shm = (SharedMemory*)mmap(NULL, sizeof(SharedMemory),
-                                             PROT_READ | PROT_WRITE,
-                                             MAP_SHARED, shm_fd, 0);
-    
-    if (shm == MAP_FAILED) {
+    SharedData* shared = (SharedData*)mmap(NULL, sizeof(SharedData),
+                                           PROT_READ | PROT_WRITE,
+                                           MAP_SHARED, shm_fd, 0);
+    if (shared == MAP_FAILED) {
         perror("mmap");
         return 1;
     }
     
     // Initialize shared memory
-    memset(shm, 0, sizeof(SharedMemory));
-    load_rubric(shm);
-    load_exam(shm, 1);
-    shm->exam_number = 1;
+    memset(shared, 0, sizeof(SharedData));
+    shared->all_done = false;
+    shared->total_exams_loaded = 0;
+    shared->next_exam_to_load = 0;
     
-    cout << "Starting with exam: " << shm->current_exam << endl << endl;
+    // Load rubric
+    std::cout << "Loading rubric into shared memory...\n";
+    load_rubric(shared);
     
-    // Fork TA processes
-    vector<pid_t> ta_pids;
+    // Get list of exam files
+    get_exam_files(shared);
+    
+    // Load first exam
+    if (shared->num_exam_files > 0) {
+        std::cout << "Loading first exam into shared memory...\n";
+        load_exam_into_memory(shared, shared->exam_filenames[0], 0);
+        shared->total_exams_loaded = 1;
+        shared->next_exam_to_load = 1;
+        std::cout << "First exam: Student " << shared->exams[0].student_number << "\n\n";
+    } else {
+        std::cerr << "Error: No exam files found\n";
+        return 1;
+    }
+    
+    // Create TA processes
+    std::vector<pid_t> ta_pids;
     for (int i = 0; i < num_tas; i++) {
         pid_t pid = fork();
         if (pid == 0) {
             // Child process
-            ta_process(i + 1, shm);
+            ta_process(shared, i + 1);
             exit(0);
         } else if (pid > 0) {
             ta_pids.push_back(pid);
@@ -255,15 +373,17 @@ int main(int argc, char* argv[]) {
         }
     }
     
-    // Wait for all TAs to finish
+    // Wait for all TAs
     for (pid_t pid : ta_pids) {
         waitpid(pid, NULL, 0);
     }
     
-    cout << endl << "=== All TAs finished ===" << endl;
+    std::cout << "\n=== All TAs finished ===\n";
+    std::cout << "Total exams processed: " << shared->total_exams_loaded << "\n";
     
     // Cleanup
-    munmap(shm, sizeof(SharedMemory));
+    munmap(shared, sizeof(SharedData));
+    close(shm_fd);
     shm_unlink("/ta_marking_shm");
     
     return 0;

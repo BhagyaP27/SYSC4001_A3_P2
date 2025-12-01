@@ -2,7 +2,7 @@
  * @file ta_marking_part_a.cpp
  * @brief Part A: TA Marking System WITHOUT Semaphores
  * @author Student 1: Bhagya Patel (101324150)
- * @author Student 2: [Name, ID]
+ * @author Student 2: Oluwatobi Olowookere (101245900)
  * 
  * This version allows Concurrent TA marking WITH semaphores (properly synchronized)
  */
